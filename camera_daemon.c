@@ -58,13 +58,20 @@ typedef struct {
     pthread_mutex_t img_lock;
     pthread_cond_t img_cond;
     size_t snapshot_request_n;//number of pending request for image
+    uint8_t* stream_header;
+    size_t stream_header_size;
     uint8_t *image_buffer;
     size_t image_max_size;
     size_t image_size;
+    uint8_t have_active_client;
+    int client_fd;
     //float fps;
 } PORT_USERDATA;
 
 PORT_USERDATA userdata;
+
+//TODO: create splitter and connect endcoder with splitter output port,
+// - grab data from splitter callback
 
 static void camera_video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
     static int frame_count = 0;
@@ -96,7 +103,7 @@ static void camera_video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T
         memcpy(output_buffer->data, buffer->data, buffer->length);
         userdata->image_size
             = (buffer->length > userdata->image_max_size) ? 
-                userdata->image_max_size : buffer->length;
+            userdata->image_max_size : buffer->length;
 
         if (userdata->snapshot_request_n)
         {
@@ -162,12 +169,33 @@ static void encoder_output_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER
     MMAL_POOL_T *pool = userdata->encoder_output_pool;
     //fprintf(stderr, "INFO:%s\n", __func__);
 
-    mmal_buffer_header_mem_lock(buffer);
+    if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG)
+    {
+        //this is video header, save this field and send this to incoming connections
+        assert(userdata->stream_header==NULL);
+        userdata->stream_header = malloc(buffer->length);
+        userdata->stream_header_size = buffer->length;
+        mmal_buffer_header_mem_lock(buffer);
+        memcpy(userdata->stream_header, buffer->data, buffer->length);
+        mmal_buffer_header_mem_unlock(buffer);
+    }else
+    {
 
-    //TODO: send data to connected clients
-    //fwrite(buffer->data, 1, buffer->length, stdout);
 
-    mmal_buffer_header_mem_unlock(buffer);
+
+        //TODO: send data to connected clients
+        //fwrite(buffer->data, 1, buffer->length, stdout);
+        if (userdata->have_active_client)
+        {
+            mmal_buffer_header_mem_lock(buffer);
+            if (write(userdata->client_fd, buffer->data, buffer->length)<0)
+            {
+                userdata->have_active_client = 0;
+                printf("connection closed\n");
+            }
+            mmal_buffer_header_mem_unlock(buffer);
+        }
+    }
 
     mmal_buffer_header_release(buffer);
     if (port->is_enabled) {
@@ -443,6 +471,21 @@ int server_on_url(http_parser *parser, const char *data, size_t length)
         }else if (!strncmp(data, "/live", length)) {
             //TODO: stream live video
             printf("request /live\n");
+
+            char* http_header = calloc(1024, sizeof(char));
+
+            int header_len = snprintf(http_header, 1024,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: video/h264\r\n"
+                    "Connection: keep-alive\r\n\r\n");
+
+            write(filedes, http_header, header_len);
+
+            free(http_header);
+            write(filedes, userdata.stream_header, userdata.stream_header_size);
+
+            userdata.client_fd = filedes;
+            userdata.have_active_client = 1;
         }
     }
     return 0;
@@ -467,7 +510,8 @@ int handle_request(int filedes)
     {
         /* Read error. */
         perror ("read");
-        exit (EXIT_FAILURE);
+        //exit (EXIT_FAILURE);
+        return -1;
     }
     else if (nbytes == 0)
     {
@@ -481,7 +525,7 @@ int handle_request(int filedes)
         parser.data = &filedes;
         http_parser_init(&parser, HTTP_REQUEST);
         int len = strlen(buffer);
-        http_parser_execute(&parser, &site_setting, buffer, len>MAXMSG?MAXMSG:len);
+        http_parser_execute(&parser, &site_setting, buffer, len>MAXMSG ? MAXMSG : len);
 
         return 0;
     }
@@ -572,6 +616,7 @@ int main(int argc, char** argv) {
     userdata.width = VIDEO_WIDTH;
     userdata.height = VIDEO_HEIGHT;
     //userdata.fps = 0.0;
+    userdata.have_active_client = 0;
 
     //uncompressed image
     userdata.image_max_size = IMAGE_BUFFER_SIZE;
