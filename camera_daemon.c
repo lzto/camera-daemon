@@ -23,8 +23,10 @@
 #include "interface/vcos/vcos.h"
 
 #include "interface/mmal/mmal.h"
+#include "interface/mmal/util/mmal_util.h"
 #include "interface/mmal/util/mmal_default_components.h"
 #include "interface/mmal/util/mmal_connection.h"
+#include "interface/mmal/util/mmal_util_params.h"
 
 #define MMAL_CAMERA_PREVIEW_PORT 0
 #define MMAL_CAMERA_VIDEO_PORT 1
@@ -37,8 +39,6 @@
 #define IMAGE_BUFFER_SIZE 3*VIDEO_WIDTH*VIDEO_HEIGHT
 
 #define PORT 7777
-
-int snapshot_request = 0;
 
 typedef struct {
     int width;
@@ -54,9 +54,14 @@ typedef struct {
     MMAL_POOL_T *encoder_input_pool;
     MMAL_PORT_T *encoder_output_port;
     MMAL_POOL_T *encoder_output_pool;
+    //producer consumer
     pthread_mutex_t img_lock;
+    pthread_cond_t img_cond;
+    size_t snapshot_request_n;//number of pending request for image
     uint8_t *image_buffer;
-    float fps;
+    size_t image_max_size;
+    size_t image_size;
+    //float fps;
 } PORT_USERDATA;
 
 PORT_USERDATA userdata;
@@ -89,12 +94,19 @@ static void camera_video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T
     if (output_buffer) {
         mmal_buffer_header_mem_lock(buffer);
         memcpy(output_buffer->data, buffer->data, buffer->length);
+        userdata->image_size
+            = (buffer->length > userdata->image_max_size) ? 
+                userdata->image_max_size : buffer->length;
 
-        if (snapshot_request && pthread_mutex_trylock(&userdata->img_lock))
+        if (userdata->snapshot_request_n)
         {
-            memcpy(local_image_buffer, buffer->data, buffer->length);
-            snapshot_request = 0;
-            pthread_mutex_unlock(&userdata->img_lock);
+            if (pthread_mutex_trylock(&userdata->img_lock))
+            {
+                memcpy(local_image_buffer, buffer->data, buffer->length);
+                userdata->snapshot_request_n = 0;
+                pthread_cond_signal(&userdata->img_cond);
+                pthread_mutex_unlock(&userdata->img_lock);
+            }
         }
 
         output_buffer->length = buffer->length;
@@ -105,8 +117,7 @@ static void camera_video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T
     } else {
         fprintf(stderr, "ERROR: mmal_queue_get (%d)\n", output_buffer);
     }
-
-
+#if 0
     if (frame_count % 10 == 0) {
         // print framerate every n frame
         clock_gettime(CLOCK_MONOTONIC, &t2);
@@ -121,7 +132,7 @@ static void camera_video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T
         userdata->fps = fps;
         fprintf(stderr, "  Frame = %d,  Framerate = %.1f fps \n", frame_count, fps);
     }
-
+#endif
 
     mmal_buffer_header_release(buffer);
 
@@ -405,9 +416,15 @@ int server_on_url(http_parser *parser, const char *data, size_t length)
     int filedes = *(int*)parser->data;
     if (parser->method == HTTP_GET) {
         if (!strncmp(data, "/snapshot", length)) {
-
+            printf("request /snapshot\n");
             //reply with image data
             pthread_mutex_lock(&userdata.img_lock);
+            userdata.snapshot_request_n = 1;
+
+            while(userdata.snapshot_request_n)
+            {
+                pthread_cond_wait(&userdata.img_cond, &userdata.img_lock);
+            }
 
             char* http_header = calloc(1024, sizeof(char));
 
@@ -415,16 +432,17 @@ int server_on_url(http_parser *parser, const char *data, size_t length)
                     "HTTP/1.1 200 OK\r\n"
                     "Content-Type: image/jpeg\r\n"
                     "Content-Length: %d\r\n"
-                    "Connection: keep-alive\r\n\r\n", IMAGE_BUFFER_SIZE);
+                    "Connection: keep-alive\r\n\r\n", userdata.image_size);
 
             write(filedes, http_header, header_len);
-            write(filedes, userdata.image_buffer, IMAGE_BUFFER_SIZE);
+            write(filedes, userdata.image_buffer, userdata.image_size);
 
             free(http_header);
 
             pthread_mutex_unlock(&userdata.img_lock);
         }else if (!strncmp(data, "/live", length)) {
             //TODO: stream live video
+            printf("request /live\n");
         }
     }
     return 0;
@@ -458,7 +476,7 @@ int handle_request(int filedes)
     } else
     {
         /* Data read. */
-        fprintf (stderr, "Server: got message: `%s'\n", buffer);
+        //fprintf (stderr, "Server: got message: `%s'\n", buffer);
         http_parser parser;
         parser.data = &filedes;
         http_parser_init(&parser, HTTP_REQUEST);
@@ -524,7 +542,7 @@ void create_server()
                         exit (EXIT_FAILURE);
                     }
                     fprintf (stderr,
-                            "Server: connect from host %s, port %hd.\n",
+                            "Server: connect from host %s, port %d.\n",
                             inet_ntoa (clientname.sin_addr),
                             ntohs (clientname.sin_port));
                     FD_SET (new, &active_fd_set);
@@ -553,12 +571,15 @@ int main(int argc, char** argv) {
 
     userdata.width = VIDEO_WIDTH;
     userdata.height = VIDEO_HEIGHT;
-    userdata.fps = 0.0;
+    //userdata.fps = 0.0;
 
     //uncompressed image
+    userdata.image_max_size = IMAGE_BUFFER_SIZE;
     userdata.image_buffer = calloc(IMAGE_BUFFER_SIZE, sizeof(uint8_t));
 
     pthread_mutex_init(&userdata.img_lock, NULL);
+    pthread_cond_init(&userdata.img_cond, NULL);
+    userdata.snapshot_request_n = 0;
 
     fprintf(stderr, "VIDEO_WIDTH : %i\n", userdata.width );
     fprintf(stderr, "VIDEO_HEIGHT: %i\n", userdata.height );
