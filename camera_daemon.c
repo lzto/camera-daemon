@@ -19,6 +19,9 @@
 
 #include <http_parser.h>
 
+#include "rtpworker.h"
+
+
 #include "bcm_host.h"
 #include "interface/vcos/vcos.h"
 
@@ -486,6 +489,11 @@ int server_on_url(http_parser *parser, const char *data, size_t length)
 
             userdata.client_fd = filedes;
             userdata.have_active_client = 1;
+        }
+    }else if (parser->method == HTTP_POST) {
+        if (!strncmp(data, "/srtp_cast_to", length)) {
+            //TODO: respawn srtp worker and cast to address
+            printf("request srtp cast\n");
         }
     }
     return 0;
