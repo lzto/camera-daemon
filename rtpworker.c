@@ -6,15 +6,14 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#include <sys/types.h>
 
 #include "util.h"
 
 #define MAX_KEY_LEN 96
 
-static void* rtsp_sender_worker(int ssrc, uint8_t * input_key)
+void prepare_srtp_sender(char* url, int ssrc, uint8_t * input_key,
+        uint8_t* video_header, size_t video_header_length)
 {
-#if 1
     //rtp_sender_t snd;
     srtp_policy_t policy;
     srtp_err_status_t status;
@@ -73,25 +72,26 @@ static void* rtsp_sender_worker(int ssrc, uint8_t * input_key)
     printf("set master key/salt to %s/", octet_string_hex_string(key, 16));
     printf("%s\n", octet_string_hex_string(key + 16, 14));
 
-    /*
-       status = rtp_sender_init_srtp(snd, &policy);
-       if (status) {
-       fprintf(stderr, "error: srtp_create() failed with code %d\n",
-       status);
-       exit(1);
-       }
-       while(1)
-       {
-       rtp_sendto(snd, word, len);
-       }
-       rtp_sender_deinit_srtp(snd);
-       rtp_sender_dealloc(snd);
-       */
-#endif
+
+    /*status = rtp_sender_init_srtp(snd, &policy);
+    if (status) {
+        fprintf(stderr, "error: srtp_create() failed with code %d\n",
+                status);
+        exit(1);
+    }*/
 
 }
-
-void respawn_rtsp_sender()
+void destroy_srtp_sender()
 {
+    //rtp_sender_deinit_srtp(snd);
+    //rtp_sender_dealloc(snd);
+}
+
+/*
+ * call this in camera encoder output callback
+ */
+int rtsp_sender_callback(uint8_t* data, size_t length)
+{
+    //rtp_sendto(snd, word, len);
 }
 
