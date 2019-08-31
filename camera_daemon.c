@@ -574,13 +574,12 @@ int server_on_body(http_parser *parser, const char* data, size_t length)
             prepare_srtp_sender(remote_address,
                     port, 
                     ssrc,
-                    key,
-                    userdata.stream_header,
-                    userdata.stream_header_size);
-
-            userdata.have_active_srtp_receiver = 1;
+                    key);
             cJSON_Delete(srtp_cfg);
             free(body);
+
+            srtp_sender_callback(userdata.stream_header, userdata.stream_header_size);
+            userdata.have_active_srtp_receiver = 1;
         }else
         {
             send_html_response(filedes, "unknown command");
@@ -641,8 +640,8 @@ void create_server()
 
     memset(&serv_addr, '0', sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
-    //serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    //serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     serv_addr.sin_port = htons(PORT);
 
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag));

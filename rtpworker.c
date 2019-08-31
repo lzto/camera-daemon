@@ -18,8 +18,7 @@
 static struct srtp_sender_context* srtpctx;
 
 void prepare_srtp_sender(const char* receiver_ip, const int receiver_port,
-        const int ssrc, const uint8_t * input_key,
-        const uint8_t* video_header, const size_t video_header_length)
+        const int ssrc, const uint8_t * input_key)
 {
     //rtp_sender_t snd;
     srtp_policy_t policy;
@@ -36,9 +35,6 @@ void prepare_srtp_sender(const char* receiver_ip, const int receiver_port,
     srtpctx->receiver_port = receiver_port;
     srtpctx->ssrc = ssrc;
     srtpctx->input_key = strdup(input_key);
-    srtpctx->video_header = malloc(video_header_length);
-    memcpy(srtpctx->video_header, video_header, video_header_length);
-    srtpctx->video_header_length = video_header_length;
 
    
     /* set up the srtp policy and master key */
@@ -133,8 +129,9 @@ int srtp_sender_callback(uint8_t* data, size_t length)
     memcpy(srtpctx->message, data, length);
     srtp_protect(srtpctx->srtp_ctx, srtpctx->message, &len);
     //printf("send udp msg len=%d\n", length);
-    sendto(srtpctx->sock, srtpctx->message, length, 0,
+    int ret = sendto(srtpctx->sock, srtpctx->message, length, 0,
             &srtpctx->raddr, sizeof(struct sockaddr_in));
+    return ret;
 }
 
 void srtp_backend_init()

@@ -14,8 +14,6 @@ struct srtp_sender_context{
     int receiver_port;
     int ssrc;
     uint8_t* input_key;
-    uint8_t* video_header;
-    size_t video_header_length;
     
     uint8_t* message;//the message we want to send
     size_t message_len;
@@ -25,8 +23,7 @@ struct srtp_sender_context{
 };
 
 void prepare_srtp_sender(const char* receiver_ip, const int receiver_port,
-        const int ssrc, const uint8_t * input_key,
-        const uint8_t* video_header, const size_t video_header_length);
+        const int ssrc, const uint8_t * input_key);
 void destroy_srtp_sender();
 
 /*
