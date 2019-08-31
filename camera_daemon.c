@@ -9,27 +9,24 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
-
 #include <netinet/in.h>
 #include <netinet/ip.h>
-
 #include <arpa/inet.h>
 
 #include <pthread.h>
 
 #include <http_parser.h>
+#include <cJSON.h>
 
 #include "rtpworker.h"
 
-
-#include "bcm_host.h"
-#include "interface/vcos/vcos.h"
-
-#include "interface/mmal/mmal.h"
-#include "interface/mmal/util/mmal_util.h"
-#include "interface/mmal/util/mmal_default_components.h"
-#include "interface/mmal/util/mmal_connection.h"
-#include "interface/mmal/util/mmal_util_params.h"
+#include <bcm_host.h>
+#include <interface/vcos/vcos.h>
+#include <interface/mmal/mmal.h>
+#include <interface/mmal/util/mmal_util.h>
+#include <interface/mmal/util/mmal_default_components.h>
+#include <interface/mmal/util/mmal_connection.h>
+#include <interface/mmal/util/mmal_util_params.h>
 
 #define MMAL_CAMERA_PREVIEW_PORT 0
 #define MMAL_CAMERA_VIDEO_PORT 1
@@ -67,7 +64,12 @@ typedef struct {
     size_t image_max_size;
     size_t image_size;
     uint8_t have_active_client;
+    uint8_t have_active_srtp_receiver;
     int client_fd;
+    
+    //used by http parser
+    char* last_url;
+    size_t last_url_size;
     //float fps;
 } PORT_USERDATA;
 
@@ -196,6 +198,12 @@ static void encoder_output_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER
                 userdata->have_active_client = 0;
                 printf("connection closed\n");
             }
+            mmal_buffer_header_mem_unlock(buffer);
+        }
+        if (userdata->have_active_srtp_receiver)
+        {
+            mmal_buffer_header_mem_lock(buffer);
+            srtp_sender_callback(buffer->data, buffer->length);
             mmal_buffer_header_mem_unlock(buffer);
         }
     }
@@ -441,10 +449,40 @@ int setup_encoder(PORT_USERDATA *userdata) {
     return 0;
 }
 
+void send_html_response(int fd, const char* body)
+{
+    char* http_header = calloc(1024, sizeof(char));
+
+    int header_len = snprintf(http_header, 1024,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: keep-alive\r\n\r\n", strlen(body));
+
+    write(fd, http_header, header_len);
+    write(fd, body, strlen(body));
+
+    free(http_header);
+}
 
 int server_on_url(http_parser *parser, const char *data, size_t length)
 {
     int filedes = *(int*)parser->data;
+    
+    if (length>=userdata.last_url_size)
+    {
+        char* p = realloc(userdata.last_url, length+1);
+        if (p!=NULL)
+        {
+            userdata.last_url =  p;
+            userdata.last_url_size = length+1;
+        }else
+            return -1;//failed to allocate memory
+    }
+    memcpy(userdata.last_url, data, length);
+    userdata.last_url[length] = 0;//trailing zero
+
+
     if (parser->method == HTTP_GET) {
         if (!strncmp(data, "/snapshot", length)) {
             printf("request /snapshot\n");
@@ -489,19 +527,70 @@ int server_on_url(http_parser *parser, const char *data, size_t length)
 
             userdata.client_fd = filedes;
             userdata.have_active_client = 1;
-        }
-    }else if (parser->method == HTTP_POST) {
-        if (!strncmp(data, "/srtp_cast_to", length)) {
-            //TODO: respawn srtp worker and cast to address
-            printf("request srtp cast\n");
+        }else if (!strncmp(data, "/stop_srtp", length)) {
+            printf("request /stop_srtp\n");
+            userdata.have_active_srtp_receiver = 0;
+            send_html_response(filedes, "OK");
         }
     }
     return 0;
 }
 
+int server_on_body(http_parser *parser, const char* data, size_t length)
+{
+    int filedes = *(int*)parser->data;
+    if (parser->method == HTTP_POST)
+    {
+        int url_len = strlen(userdata.last_url);
+        if (!strncmp(userdata.last_url, "/srtp_cast_to", url_len))
+        {
+            //prepare srtp and cast to address
+            send_html_response(filedes, "OK");
+            //initialize srtp backend
+            //need remote address, port, ssrc, key, video header, video header length
+            char* body = malloc(length+1);
+            memcpy(body, data, length);
+            body[length] = 0;
+            cJSON* srtp_cfg = cJSON_Parse(body);
+            
+            //prepare_srtp_sender(remote_address, port, ssrc, key,
+            //                        userdata.video_header, userdata.video_header_length);
+            const cJSON* json_addr = cJSON_GetObjectItemCaseSensitive(srtp_cfg, "addr");
+            const char* remote_address = json_addr->valuestring;
+            assert(cJSON_IsString(json_addr));
+
+            const cJSON* json_port = cJSON_GetObjectItemCaseSensitive(srtp_cfg, "port");
+            assert(cJSON_IsNumber(json_port));
+            const int port = json_port->valueint;
+
+            const cJSON* json_ssrc = cJSON_GetObjectItemCaseSensitive(srtp_cfg, "ssrc");
+            assert(cJSON_IsNumber(json_ssrc));
+            const int ssrc = json_ssrc->valueint;
+
+            const cJSON* json_key = cJSON_GetObjectItemCaseSensitive(srtp_cfg, "key");
+            assert(cJSON_IsString(json_key));
+            const char* key = json_key->valuestring;
+
+            prepare_srtp_sender(remote_address,
+                    port, 
+                    ssrc,
+                    key,
+                    userdata.stream_header,
+                    userdata.stream_header_size);
+
+            userdata.have_active_srtp_receiver = 1;
+            cJSON_Delete(srtp_cfg);
+            free(body);
+        }else
+        {
+            send_html_response(filedes, "unknown command");
+        }
+    }
+}
+
 static http_parser_settings site_setting = {
     .on_url = server_on_url,
-    //    .on_body = server_on_body,
+    .on_body = server_on_body,
     //    .on_message_complete = server_on_message_complete,
 };
 
@@ -612,13 +701,13 @@ void create_server()
             }
         }
     }
-
 }
 
 int main(int argc, char** argv) {
 
     MMAL_STATUS_T status;
 
+    srtp_backend_init();
 
     memset(&userdata, 0, sizeof (PORT_USERDATA));
 
@@ -626,6 +715,9 @@ int main(int argc, char** argv) {
     userdata.height = VIDEO_HEIGHT;
     //userdata.fps = 0.0;
     userdata.have_active_client = 0;
+
+    userdata.last_url = calloc(1, 16);
+    userdata.last_url_size = 16;
 
     //uncompressed image
     userdata.image_max_size = IMAGE_BUFFER_SIZE;
@@ -652,7 +744,7 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    //create a server and handle request
+    //create a server and handle request, never return
     create_server();
 
     return 0;

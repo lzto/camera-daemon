@@ -167,7 +167,7 @@ char *octet_string_hex_string(const void *s, int length)
 static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                                "abcdefghijklmnopqrstuvwxyz0123456789+/";
 
-static int base64_block_to_octet_triple(char *out, char *in)
+static int base64_block_to_octet_triple(char *out, const char *in)
 {
     unsigned char sextets[4] = { 0 };
     int j = 0;
@@ -192,7 +192,7 @@ static int base64_block_to_octet_triple(char *out, char *in)
     return j;
 }
 
-int base64_string_to_octet_string(char *out, int *pad, char *in, int len)
+int base64_string_to_octet_string(char *out, int *pad, const char *in, int len)
 {
     int k = 0;
     int i = 0;
