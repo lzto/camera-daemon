@@ -32,9 +32,15 @@
 #define MMAL_CAMERA_VIDEO_PORT 1
 #define MMAL_CAMERA_CAPTURE_PORT 2
 
-#define VIDEO_FPS 30 
-#define VIDEO_WIDTH 1280
-#define VIDEO_HEIGHT 720
+#if 1
+#define VIDEO_FPS 30
+#define VIDEO_WIDTH 1920
+#define VIDEO_HEIGHT 1080
+#else
+#define VIDEO_FPS 10 
+#define VIDEO_WIDTH 640
+#define VIDEO_HEIGHT 360
+#endif
 
 #define IMAGE_BUFFER_SIZE 3*VIDEO_WIDTH*VIDEO_HEIGHT
 
@@ -66,11 +72,11 @@ typedef struct {
     uint8_t have_active_client;
     uint8_t have_active_srtp_receiver;
     int client_fd;
-    
+
     //used by http parser
     char* last_url;
     size_t last_url_size;
-    //float fps;
+    float fps;
 } PORT_USERDATA;
 
 PORT_USERDATA userdata;
@@ -112,6 +118,7 @@ static void camera_video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T
 
         if (userdata->snapshot_request_n)
         {
+            //only use key frame
             if (pthread_mutex_trylock(&userdata->img_lock))
             {
                 memcpy(local_image_buffer, buffer->data, buffer->length);
@@ -183,30 +190,49 @@ static void encoder_output_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER
         mmal_buffer_header_mem_lock(buffer);
         memcpy(userdata->stream_header, buffer->data, buffer->length);
         mmal_buffer_header_mem_unlock(buffer);
+    }else if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_CODECSIDEINFO)
+    {
     }else
     {
-
-
+        static int srtp_frame_start = -1;
 
         //TODO: send data to connected clients
         //fwrite(buffer->data, 1, buffer->length, stdout);
         if (userdata->have_active_client)
         {
+            //need to send key frame first
+            static int frame_start = -1;
+            if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_KEYFRAME)
+                frame_start = 1;
+            if (frame_start==-1)
+                goto next;
+
             mmal_buffer_header_mem_lock(buffer);
             if (write(userdata->client_fd, buffer->data, buffer->length)<0)
             {
+                frame_start = -1;
                 userdata->have_active_client = 0;
                 printf("connection closed\n");
             }
             mmal_buffer_header_mem_unlock(buffer);
         }
+next:
         if (userdata->have_active_srtp_receiver)
         {
+            if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_KEYFRAME)
+                srtp_frame_start = 1;
+            if (srtp_frame_start==-1)
+                goto end;
+
             mmal_buffer_header_mem_lock(buffer);
             srtp_sender_callback(buffer->data, buffer->length);
             mmal_buffer_header_mem_unlock(buffer);
+        }else
+        {
+            srtp_frame_start = -1;
         }
     }
+end:
 
     mmal_buffer_header_release(buffer);
     if (port->is_enabled) {
@@ -267,16 +293,16 @@ int setup_camera(PORT_USERDATA *userdata) {
     {
         MMAL_PARAMETER_CAMERA_CONFIG_T cam_config = {
             { MMAL_PARAMETER_CAMERA_CONFIG, sizeof (cam_config)},
-            .max_stills_w = 1280,
-            .max_stills_h = 720,
+            .max_stills_w = VIDEO_WIDTH,
+            .max_stills_h = VIDEO_HEIGHT,
             .stills_yuv422 = 0,
-            .one_shot_stills = 1,
+            .one_shot_stills = 0,
             .max_preview_video_w = VIDEO_WIDTH,
             .max_preview_video_h = VIDEO_HEIGHT,
             .num_preview_video_frames = 3,
             .stills_capture_circular_buffer_height = 0,
             .fast_preview_resume = 0,
-            .use_stc_timestamp = MMAL_PARAM_TIMESTAMP_MODE_RESET_STC
+            .use_stc_timestamp = MMAL_PARAM_TIMESTAMP_MODE_RAW_STC
         };
         mmal_port_parameter_set(camera->control, &cam_config.hdr);
     }
@@ -303,7 +329,7 @@ int setup_camera(PORT_USERDATA *userdata) {
     mmal_format_copy(camera_video_port->format, camera_preview_port->format);
 
     format = camera_video_port->format;
-    format->encoding = MMAL_ENCODING_I420;
+    format->encoding = MMAL_ENCODING_OPAQUE;
     format->encoding_variant = MMAL_ENCODING_I420;
     format->es->video.width = VIDEO_WIDTH;
     format->es->video.height = VIDEO_HEIGHT;
@@ -314,8 +340,8 @@ int setup_camera(PORT_USERDATA *userdata) {
     format->es->video.frame_rate.num = VIDEO_FPS;
     format->es->video.frame_rate.den = 1;
 
-    camera_video_port->buffer_size = format->es->video.width * format->es->video.height * 12 / 8;
-    camera_video_port->buffer_num = 2;
+    camera_video_port->buffer_size = camera_video_port->buffer_size_recommended;
+    camera_video_port->buffer_num = camera_video_port->buffer_num_recommended;
 
     fprintf(stderr, "INFO:camera video buffer_size = %d\n", camera_video_port->buffer_size);
     fprintf(stderr, "INFO:camera video buffer_num = %d\n", camera_video_port->buffer_num);
@@ -326,7 +352,8 @@ int setup_camera(PORT_USERDATA *userdata) {
         return -1;
     }
 
-    camera_video_port_pool = (MMAL_POOL_T *) mmal_port_pool_create(camera_video_port, camera_video_port->buffer_num, camera_video_port->buffer_size);
+    camera_video_port_pool = (MMAL_POOL_T *) mmal_port_pool_create(camera_video_port,
+            camera_video_port->buffer_num, camera_video_port->buffer_size);
     userdata->camera_video_port_pool = camera_video_port_pool;
     camera_video_port->userdata = (struct MMAL_PORT_USERDATA_T *) userdata;
 
@@ -393,7 +420,11 @@ int setup_encoder(PORT_USERDATA *userdata) {
 
     // Only supporting H264 at the moment
     encoder_output_port->format->encoding = MMAL_ENCODING_H264;
-    encoder_output_port->format->bitrate = 2000000;
+    encoder_output_port->format->bitrate = 300000;
+    encoder_output_port->format->es->video.crop.width = VIDEO_WIDTH;
+    encoder_output_port->format->es->video.crop.height = VIDEO_HEIGHT;
+    encoder_output_port->format->es->video.frame_rate.num = VIDEO_FPS;
+    encoder_output_port->format->es->video.frame_rate.den = 1;
 
     encoder_output_port->buffer_size = encoder_output_port->buffer_size_recommended;
 
@@ -415,6 +446,21 @@ int setup_encoder(PORT_USERDATA *userdata) {
         return -1;
     }
 
+    //configure H264 profile
+    MMAL_PARAMETER_VIDEO_PROFILE_T  param;
+    param.hdr.id = MMAL_PARAMETER_PROFILE;
+    param.hdr.size = sizeof(param);
+
+    //param.profile[0].profile = MMAL_VIDEO_PROFILE_H264_MAIN;
+    param.profile[0].profile = MMAL_VIDEO_PROFILE_H264_HIGH;
+    param.profile[0].level = MMAL_VIDEO_LEVEL_H264_4; // This is the only value supported
+
+    status = mmal_port_parameter_set(encoder_output_port, &param.hdr);
+    if (status != MMAL_SUCCESS)
+    {
+        fprintf(stderr,"Unable to set H264 profile\n");
+    }
+
     fprintf(stderr, " encoder input buffer_size = %d\n", encoder_input_port->buffer_size);
     fprintf(stderr, " encoder input buffer_num = %d\n", encoder_input_port->buffer_num);
 
@@ -430,6 +476,14 @@ int setup_encoder(PORT_USERDATA *userdata) {
         return -1;
     }
     fprintf(stderr, "INFO:Encoder input pool has been created\n");
+
+
+    status = mmal_component_enable(encoder);
+    if (status != MMAL_SUCCESS)
+    {
+        fprintf(stderr,"can't enable encoder component\n");
+        return -1;
+    }
 
 
     encoder_output_port_pool = (MMAL_POOL_T *) mmal_port_pool_create(encoder_output_port, encoder_output_port->buffer_num, encoder_output_port->buffer_size);
@@ -468,7 +522,7 @@ void send_html_response(int fd, const char* body)
 int server_on_url(http_parser *parser, const char *data, size_t length)
 {
     int filedes = *(int*)parser->data;
-    
+
     if (length>=userdata.last_url_size)
     {
         char* p = realloc(userdata.last_url, length+1);
@@ -552,7 +606,7 @@ int server_on_body(http_parser *parser, const char* data, size_t length)
             memcpy(body, data, length);
             body[length] = 0;
             cJSON* srtp_cfg = cJSON_Parse(body);
-            
+
             //prepare_srtp_sender(remote_address, port, ssrc, key,
             //                        userdata.video_header, userdata.video_header_length);
             const cJSON* json_addr = cJSON_GetObjectItemCaseSensitive(srtp_cfg, "addr");

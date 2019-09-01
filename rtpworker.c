@@ -31,12 +31,17 @@ void prepare_srtp_sender(const char* receiver_ip, const int receiver_port,
     printf("prepare srtp stream: %s:%d ssrc=%d, key=%s\n",
             receiver_ip, receiver_port, ssrc, input_key);
 
-    srtpctx->receiver_ip = strdup(receiver_ip);
-    srtpctx->receiver_port = receiver_port;
-    srtpctx->ssrc = ssrc;
-    srtpctx->input_key = strdup(input_key);
+    srtpctx->message.header.ssrc = htonl(ssrc);
+    srtpctx->message.header.ts = 0;
+    srtpctx->message.header.seq = 0;
+    srtpctx->message.header.m = 0;
+    srtpctx->message.header.pt = 99;//magic number
+    srtpctx->message.header.version = 2;
+    srtpctx->message.header.p = 0;
+    srtpctx->message.header.x = 0;
+    srtpctx->message.header.cc = 0;
 
-   
+
     /* set up the srtp policy and master key */
 
     memset(&policy, 0, sizeof(srtp_policy_t));
@@ -120,7 +125,43 @@ void destroy_srtp_sender()
 
 /*
  * call this in camera encoder output callback
+ * breakdown data into multiple segments of size RTP_PKT_BODY_SIZE
  */
+#if 1
+int srtp_sender_callback(uint8_t* data, size_t length)
+{
+    int offset = 0;
+    while (offset<length)
+    {
+        int body_len;
+        int pkt_len;
+        if ((offset+RTP_PKT_BODY_SIZE)<length)
+        {
+            body_len = RTP_PKT_BODY_SIZE;
+            offset += RTP_PKT_BODY_SIZE;
+        }
+        else
+        {
+            body_len = length - offset;
+            offset = length;
+        }
+        pkt_len = body_len + RTP_HEADER_LEN;
+        memcpy(srtpctx->message.body, &data[offset], body_len);
+
+        //update header
+        struct srtp_hdr_t* hdr = &srtpctx->message.header;
+        hdr->seq = ntohs(hdr->seq) + 1;
+        hdr->seq = htons(hdr->seq);
+        hdr->ts = ntohs(hdr->ts) + 1;
+        hdr->ts = htons(hdr->ts);
+
+        srtp_protect(srtpctx->srtp_ctx, &srtpctx->message.header, &pkt_len);
+        sendto(srtpctx->sock, (void*)&srtpctx->message, pkt_len, 0,
+                &srtpctx->raddr, sizeof(struct sockaddr_in));
+    }
+}
+
+#else
 int srtp_sender_callback(uint8_t* data, size_t length)
 {
     int len = length;
@@ -133,14 +174,12 @@ int srtp_sender_callback(uint8_t* data, size_t length)
             &srtpctx->raddr, sizeof(struct sockaddr_in));
     return ret;
 }
+#endif
 
 void srtp_backend_init()
 {
     printf("called srtp_init()\n");
     srtp_init();
     srtpctx = calloc(1,sizeof(struct srtp_sender_context));
-    srtpctx->message = calloc(1,1024*1024);
-    srtpctx->message_len = 1024*1024;
-
 }
 
