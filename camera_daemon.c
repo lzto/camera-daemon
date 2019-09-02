@@ -30,7 +30,11 @@
 
 #define MMAL_CAMERA_PREVIEW_PORT 0
 #define MMAL_CAMERA_VIDEO_PORT 1
-#define MMAL_CAMERA_CAPTURE_PORT 2
+#define MMAL_CAMERA_STILL_PORT 2
+
+
+#define SNAPSHOT_WIDTH 1920
+#define SNAPSHOT_HEIGHT 1080
 
 #if 1
 #define VIDEO_FPS 30
@@ -50,16 +54,23 @@ typedef struct {
     int width;
     int height;
     MMAL_COMPONENT_T *camera;
-    MMAL_COMPONENT_T *encoder;
+    MMAL_COMPONENT_T *splitter_component;
     MMAL_COMPONENT_T *preview;
-    MMAL_PORT_T *camera_preview_port;
-    MMAL_PORT_T *camera_video_port;
-    MMAL_PORT_T *camera_still_port;
-    MMAL_POOL_T *camera_video_port_pool;
-    MMAL_PORT_T *encoder_input_port;
-    MMAL_POOL_T *encoder_input_pool;
-    MMAL_PORT_T *encoder_output_port;
-    MMAL_POOL_T *encoder_output_pool;
+    MMAL_COMPONENT_T *video_encoder;
+    MMAL_COMPONENT_T *jpeg_component;
+    MMAL_COMPONENT_T *resize_component;
+
+    MMAL_CONNECTION_T *splitter_connection;
+    MMAL_CONNECTION_T *resize_connection;
+    MMAL_CONNECTION_T *video_encoder_connection;
+    MMAL_CONNECTION_T *jpeg_connection;
+
+    MMAL_POOL_T* video_encoder_output_pool;
+    MMAL_POOL_T* jpeg_encoder_output_pool;
+
+    //mmal_output camera_output;
+    //mmal_output secondary_output;
+
     //producer consumer
     pthread_mutex_t img_lock;
     pthread_cond_t img_cond;
@@ -81,104 +92,66 @@ typedef struct {
 
 PORT_USERDATA userdata;
 
-//TODO: create splitter and connect endcoder with splitter output port,
-// - grab data from splitter callback
-
-static void camera_video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
-    static int frame_count = 0;
-    static struct timespec t1;
-    struct timespec t2;
-    uint8_t *local_image_buffer;
-
-    //fprintf(stderr, "INFO:%s\n", __func__);
-    if (frame_count == 0) {
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t2);
-
-    int d = t2.tv_sec - t1.tv_sec;
-
-    MMAL_BUFFER_HEADER_T *new_buffer;
-    MMAL_BUFFER_HEADER_T *output_buffer = 0;
+static void jpeg_encoder_output_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T* buffer) {
     PORT_USERDATA *userdata = (PORT_USERDATA *) port->userdata;
+    MMAL_POOL_T *pool = userdata->jpeg_encoder_output_pool;
 
-    MMAL_POOL_T *pool = userdata->camera_video_port_pool;
+    static int already_acquired_lock = 0;
+    static int state = 0;
+    //1 - start
+    //0 - not start
 
-    local_image_buffer = userdata->image_buffer;
-    frame_count++;
-
-    output_buffer = mmal_queue_get(userdata->encoder_input_pool->queue);
-
-    if (output_buffer) {
-        mmal_buffer_header_mem_lock(buffer);
-        memcpy(output_buffer->data, buffer->data, buffer->length);
-        userdata->image_size
-            = (buffer->length > userdata->image_max_size) ? 
-            userdata->image_max_size : buffer->length;
-
-        if (userdata->snapshot_request_n)
+    //TODO: send snapshot
+    if (!userdata->snapshot_request_n)
+        goto end;
+    if (!already_acquired_lock)
+        if (pthread_mutex_trylock(&userdata->img_lock))
+            already_acquired_lock = 1;
+    if (already_acquired_lock)
+    {
+        if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_FRAME_END)
         {
-            //only use key frame
-            if (pthread_mutex_trylock(&userdata->img_lock))
+            //this is the end of previous frame,
+            //we start from next frame
+            if (state == 0)
             {
-                memcpy(local_image_buffer, buffer->data, buffer->length);
+                userdata->image_size = 0;
+                state = 1;
+                goto end;
+            }
+        }
+        if (state)
+        {
+            uint8_t* local_image_buffer = userdata->image_buffer;
+            memcpy(&local_image_buffer[userdata->image_size],
+                    buffer->data, buffer->length);
+            userdata->image_size += buffer->length;
+        }
+        if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_FRAME_END)
+        {
+            if (state==1)
+            {
                 userdata->snapshot_request_n = 0;
                 pthread_cond_signal(&userdata->img_cond);
                 pthread_mutex_unlock(&userdata->img_lock);
+                already_acquired_lock = 0;
             }
+            state = 0;
         }
-
-        output_buffer->length = buffer->length;
-        mmal_buffer_header_mem_unlock(buffer);
-        if (mmal_port_send_buffer(userdata->encoder_input_port, output_buffer) != MMAL_SUCCESS) {
-            fprintf(stderr, "ERROR: Unable to send buffer \n");
-        }
-    } else {
-        fprintf(stderr, "ERROR: mmal_queue_get (%d)\n", output_buffer);
     }
-#if 0
-    if (frame_count % 10 == 0) {
-        // print framerate every n frame
-        clock_gettime(CLOCK_MONOTONIC, &t2);
-        float d = (t2.tv_sec + t2.tv_nsec / 1000000000.0) - (t1.tv_sec + t1.tv_nsec / 1000000000.0);
-        float fps = 0.0;
-
-        if (d > 0) {
-            fps = frame_count / d;
-        } else {
-            fps = frame_count;
-        }
-        userdata->fps = fps;
-        fprintf(stderr, "  Frame = %d,  Framerate = %.1f fps \n", frame_count, fps);
-    }
-#endif
-
+end:
     mmal_buffer_header_release(buffer);
-
-    // and send one back to the port (if still open)
     if (port->is_enabled) {
-        MMAL_STATUS_T status;
-
-        new_buffer = mmal_queue_get(pool->queue);
-
-        if (new_buffer) {
-            status = mmal_port_send_buffer(port, new_buffer);
-        }
-
-        if (!new_buffer || status != MMAL_SUCCESS) {
-            fprintf(stderr, "Error: Unable to return a buffer to the video port\n");
-        }
+        MMAL_BUFFER_HEADER_T *new_buffer = mmal_queue_get(pool->queue);
+        if (new_buffer)
+            mmal_port_send_buffer(port,new_buffer);
     }
 }
-static void encoder_input_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
-    //fprintf(stderr, "INFO:%s\n", __func__);    
-    mmal_buffer_header_release(buffer);
-}
 
-static void encoder_output_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
+static void video_encoder_output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
     MMAL_BUFFER_HEADER_T *new_buffer;
     PORT_USERDATA *userdata = (PORT_USERDATA *) port->userdata;
-    MMAL_POOL_T *pool = userdata->encoder_output_pool;
+    MMAL_POOL_T *pool = userdata->video_encoder_output_pool;
     //fprintf(stderr, "INFO:%s\n", __func__);
 
     if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG)
@@ -266,14 +239,33 @@ int fill_port_buffer(MMAL_PORT_T *port, MMAL_POOL_T *pool) {
     }
 }
 
+static MMAL_STATUS_T connect_ports(MMAL_PORT_T *source_port,
+        MMAL_PORT_T *sink_port, MMAL_CONNECTION_T **connection)
+{
+    MMAL_STATUS_T status;
+
+    status =  mmal_connection_create(connection, source_port,
+            sink_port, MMAL_CONNECTION_FLAG_TUNNELLING | MMAL_CONNECTION_FLAG_ALLOCATION_ON_INPUT);
+
+    if (status == MMAL_SUCCESS) {
+        status =  mmal_connection_enable(*connection);
+        if (status != MMAL_SUCCESS) {
+            fprintf(stderr,"%s: Unable to enable connection: error %d", status);
+            mmal_connection_destroy(*connection);
+        }
+    }
+    else {
+        fprintf(stderr, "%s: Unable to create connection: error %d", status);
+    }
+
+    return status;
+}
+
 int setup_camera(PORT_USERDATA *userdata) {
     MMAL_STATUS_T status;
     MMAL_COMPONENT_T *camera = 0;
     MMAL_ES_FORMAT_T *format;
-    MMAL_PORT_T * camera_preview_port;
     MMAL_PORT_T * camera_video_port;
-    MMAL_PORT_T * camera_still_port;
-    MMAL_POOL_T * camera_video_port_pool;
 
     status = mmal_component_create(MMAL_COMPONENT_DEFAULT_CAMERA, &camera);
     if (status != MMAL_SUCCESS) {
@@ -281,14 +273,7 @@ int setup_camera(PORT_USERDATA *userdata) {
         return -1;
     }
     userdata->camera = camera;
-    userdata->camera_preview_port = camera->output[MMAL_CAMERA_PREVIEW_PORT];
-    userdata->camera_video_port = camera->output[MMAL_CAMERA_VIDEO_PORT];
-    userdata->camera_still_port = camera->output[MMAL_CAMERA_CAPTURE_PORT];
-
-    camera_preview_port = camera->output[MMAL_CAMERA_PREVIEW_PORT];
     camera_video_port = camera->output[MMAL_CAMERA_VIDEO_PORT];
-    camera_still_port = camera->output[MMAL_CAMERA_CAPTURE_PORT];
-
 
     {
         MMAL_PARAMETER_CAMERA_CONFIG_T cam_config = {
@@ -307,29 +292,9 @@ int setup_camera(PORT_USERDATA *userdata) {
         mmal_port_parameter_set(camera->control, &cam_config.hdr);
     }
 
-    // Setup camera preview port format 
-    format = camera_preview_port->format;
-    format->encoding = MMAL_ENCODING_OPAQUE;
-    format->encoding_variant = MMAL_ENCODING_I420;
-    format->es->video.width = VIDEO_WIDTH;
-    format->es->video.height = VIDEO_HEIGHT;
-    format->es->video.crop.x = 0;
-    format->es->video.crop.y = 0;
-    format->es->video.crop.width = VIDEO_WIDTH;
-    format->es->video.crop.height = VIDEO_HEIGHT;
-
-    status = mmal_port_format_commit(camera_preview_port);
-
-    if (status != MMAL_SUCCESS) {
-        fprintf(stderr, "Error: camera viewfinder format couldn't be set\n");
-        return -1;
-    }
-
-    // Setup camera video port format
-    mmal_format_copy(camera_video_port->format, camera_preview_port->format);
-
+    // Setup camera video port format 
     format = camera_video_port->format;
-    format->encoding = MMAL_ENCODING_OPAQUE;
+    format->encoding = MMAL_ENCODING_I420;
     format->encoding_variant = MMAL_ENCODING_I420;
     format->es->video.width = VIDEO_WIDTH;
     format->es->video.height = VIDEO_HEIGHT;
@@ -352,61 +317,151 @@ int setup_camera(PORT_USERDATA *userdata) {
         return -1;
     }
 
-    camera_video_port_pool = (MMAL_POOL_T *) mmal_port_pool_create(camera_video_port,
-            camera_video_port->buffer_num, camera_video_port->buffer_size);
-    userdata->camera_video_port_pool = camera_video_port_pool;
     camera_video_port->userdata = (struct MMAL_PORT_USERDATA_T *) userdata;
 
-
-    status = mmal_port_enable(camera_video_port, camera_video_buffer_callback);
-
-    if (status != MMAL_SUCCESS) {
-        fprintf(stderr, "Error: unable to enable camera video port (%u)\n", status);
-        return -1;
-    }
-
-    status = mmal_component_enable(camera);
-    if (status != MMAL_SUCCESS) {
+    if (mmal_component_enable(camera) != MMAL_SUCCESS) {
         fprintf(stderr, "Error: unable to enable camera (%u)\n", status);
         return -1;
-    }
-
-
-    fill_port_buffer(userdata->camera_video_port, userdata->camera_video_port_pool);
-
-    if (mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 1) != MMAL_SUCCESS) {
-        printf("%s: Failed to start capture\n", __func__);
     }
 
     fprintf(stderr, "INFO: camera created\n");
     return 0;
 }
 
-int setup_encoder(PORT_USERDATA *userdata) {
+int setup_splitter(PORT_USERDATA *userdata) {
+    MMAL_STATUS_T status;
+    MMAL_COMPONENT_T* splitter_component;
+    MMAL_PORT_T *input_port;
+    MMAL_PORT_T *source_port = userdata->camera->output[MMAL_CAMERA_VIDEO_PORT];
+
+    status = mmal_component_create(MMAL_COMPONENT_DEFAULT_VIDEO_SPLITTER, &splitter_component);
+
+    if (status != MMAL_SUCCESS) {
+        fprintf(stderr, "%s: Failed to create splitter component");
+        goto error;
+    }
+
+    input_port = splitter_component->input[0];
+    mmal_format_copy(input_port->format, source_port->format);
+    input_port->buffer_num = 3;
+    status = mmal_port_format_commit(input_port);
+    if (status != MMAL_SUCCESS)
+    {
+        fprintf(stderr, "Couldn't set splitter input port format : error %d\n", status);
+        goto error;
+    }
+
+    for(int i = 0; i < splitter_component->output_num; i++)
+    {
+        printf("setting up splitter output format:%d\n", i);
+        MMAL_PORT_T *output_port = splitter_component->output[i];
+        output_port->buffer_num = 3;
+        mmal_format_copy(output_port->format,input_port->format);
+        status = mmal_port_format_commit(output_port);
+        if (status != MMAL_SUCCESS)
+        {
+            fprintf(stderr,"Couldn't set splitter output port format : error %d\n", status);
+            goto error;
+        }
+    }
+
+    userdata->splitter_component = splitter_component;
+
+    if (connect_ports(source_port,
+            splitter_component->input[0],
+            &userdata->splitter_connection)!=MMAL_SUCCESS)
+    {
+        fprintf(stderr,"can't connect splitter ports\n");
+        goto error;
+    }
+
+    return 0;
+
+error:
+    if (splitter_component) {
+        mmal_component_destroy(splitter_component);
+    }
+    return -1;
+
+
+}
+
+int setup_resizer(PORT_USERDATA *userdata, int width, int height) {
+    MMAL_STATUS_T status;
+    MMAL_COMPONENT_T *resize_component;
+    MMAL_PORT_T *input_port;
+
+    MMAL_PORT_T *source_port = userdata->splitter_component->output[1];
+
+    status = mmal_component_create("vc.ril.resize", &resize_component);
+
+    if (status != MMAL_SUCCESS) {
+        fprintf(stderr, "Failed to create resize component\n");
+        goto error;
+    }
+    userdata->resize_component = resize_component;
+
+    input_port = resize_component->input[0];
+    mmal_format_copy(input_port->format, source_port->format);
+    input_port->buffer_num = 3;
+    status = mmal_port_format_commit(input_port);
+    if (status != MMAL_SUCCESS)
+    {
+        fprintf(stderr, "Couldn't set resize input port format : error %d\n", status);
+        goto error;
+    }
+
+    MMAL_PORT_T *output_port = resize_component->output[0];
+    output_port->buffer_num = 3;
+    mmal_format_copy(output_port->format,input_port->format);
+    output_port->format->es->video.width = width;
+    output_port->format->es->video.height = height;
+    output_port->format->es->video.crop.x = 0;
+    output_port->format->es->video.crop.y = 0;
+    output_port->format->es->video.crop.width = width;
+    output_port->format->es->video.crop.height = height;
+
+    status = mmal_port_format_commit(output_port);
+    if (status != MMAL_SUCCESS)
+    {
+        fprintf(stderr, "Couldn't set resize output port format : error %d\n", status);
+        goto error;
+    }
+    if (connect_ports(source_port,
+            resize_component->input[0],
+            &userdata->resize_connection)!=MMAL_SUCCESS)
+    {
+        fprintf(stderr,"can't connect resize ports\n");
+        goto error;
+    }
+
+    return 0;
+
+error:
+    if (resize_component) {
+        mmal_component_destroy(resize_component);
+    }
+    return -1;
+}
+
+int setup_video_encoder(PORT_USERDATA *userdata) {
     MMAL_STATUS_T status;
     MMAL_COMPONENT_T *encoder = 0;
-    MMAL_PORT_T *preview_input_port = NULL;
+    MMAL_PORT_T *source_port = userdata->splitter_component->output[0];
 
     MMAL_PORT_T *encoder_input_port = NULL, *encoder_output_port = NULL;
-    MMAL_POOL_T *encoder_input_port_pool;
-    MMAL_POOL_T *encoder_output_port_pool;
 
     status = mmal_component_create(MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER, &encoder);
     if (status != MMAL_SUCCESS) {
         fprintf(stderr, "Error: unable to create preview (%u)\n", status);
         return -1;
     }
+    userdata->video_encoder = encoder;
 
     encoder_input_port = encoder->input[0];
     encoder_output_port = encoder->output[0];
-    userdata->encoder_input_port = encoder_input_port;
-    userdata->encoder_output_port = encoder_input_port;
 
-    mmal_format_copy(encoder_input_port->format, userdata->camera_video_port->format);
-    encoder_input_port->buffer_size = encoder_input_port->buffer_size_recommended;
-    encoder_input_port->buffer_num = 2;
-
-
+    mmal_format_copy(encoder_input_port->format, source_port->format);
     mmal_format_copy(encoder_output_port->format, encoder_input_port->format);
 
     encoder_output_port->buffer_size = encoder_output_port->buffer_size_recommended;
@@ -467,40 +522,102 @@ int setup_encoder(PORT_USERDATA *userdata) {
     fprintf(stderr, " encoder output buffer_size = %d\n", encoder_output_port->buffer_size);
     fprintf(stderr, " encoder output buffer_num = %d\n", encoder_output_port->buffer_num);
 
-    encoder_input_port_pool = (MMAL_POOL_T *) mmal_port_pool_create(encoder_input_port, encoder_input_port->buffer_num, encoder_input_port->buffer_size);
-    userdata->encoder_input_pool = encoder_input_port_pool;
     encoder_input_port->userdata = (struct MMAL_PORT_USERDATA_T *) userdata;
-    status = mmal_port_enable(encoder_input_port, encoder_input_buffer_callback);
-    if (status != MMAL_SUCCESS) {
-        fprintf(stderr, "Error: unable to enable encoder input port (%u)\n", status);
-        return -1;
-    }
-    fprintf(stderr, "INFO:Encoder input pool has been created\n");
 
-
-    status = mmal_component_enable(encoder);
-    if (status != MMAL_SUCCESS)
+    if (mmal_component_enable(encoder) != MMAL_SUCCESS)
     {
         fprintf(stderr,"can't enable encoder component\n");
         return -1;
     }
 
+    connect_ports(source_port,
+            encoder_input_port, &userdata->video_encoder_connection);
 
-    encoder_output_port_pool = (MMAL_POOL_T *) mmal_port_pool_create(encoder_output_port, encoder_output_port->buffer_num, encoder_output_port->buffer_size);
-    userdata->encoder_output_pool = encoder_output_port_pool;
+    userdata->video_encoder_output_pool
+        = (MMAL_POOL_T *) mmal_port_pool_create(encoder_output_port,
+                encoder_output_port->buffer_num, encoder_output_port->buffer_size);
     encoder_output_port->userdata = (struct MMAL_PORT_USERDATA_T *) userdata;
 
-    status = mmal_port_enable(encoder_output_port, encoder_output_buffer_callback);
+    status = mmal_port_enable(encoder_output_port, video_encoder_output_callback);
     if (status != MMAL_SUCCESS) {
         fprintf(stderr, "Error: unable to enable encoder output port (%u)\n", status);
         return -1;
     }
-    fprintf(stderr, "INFO:Encoder output pool has been created\n");    
-
-    fill_port_buffer(encoder_output_port, encoder_output_port_pool);
-
+    fill_port_buffer(encoder_output_port, userdata->video_encoder_output_pool);
     fprintf(stderr, "INFO:Encoder has been created\n");
     return 0;
+}
+
+int setup_jpeg_encoder(PORT_USERDATA *userdata) {
+    MMAL_STATUS_T status;
+    MMAL_COMPONENT_T *jpeg_component = 0;
+    MMAL_PORT_T *source_port = userdata->resize_component->output[0];
+    MMAL_PORT_T *input_port, *output_port;
+
+    status = mmal_component_create(MMAL_COMPONENT_DEFAULT_IMAGE_ENCODER, &jpeg_component);
+
+    if (status != MMAL_SUCCESS) {
+        fprintf(stderr,"can't create jpeg component\n");
+        goto error;
+    }
+    userdata->jpeg_component = jpeg_component;
+
+    input_port = jpeg_component->input[0];
+    output_port = jpeg_component->output[0];
+    mmal_format_copy(output_port->format, input_port->format);
+
+    output_port->format->encoding = MMAL_ENCODING_JPEG;
+    output_port->buffer_size = output_port->buffer_size_recommended;
+    output_port->buffer_num = output_port->buffer_num_recommended;
+
+    if (output_port->buffer_size < output_port->buffer_size_min)
+    {
+        output_port->buffer_size = output_port->buffer_size_min;
+    }
+    if (output_port->buffer_num < output_port->buffer_num_min)
+    {
+        output_port->buffer_num = output_port->buffer_num_min;
+    }
+
+    status = mmal_port_format_commit(output_port);
+    if (status != MMAL_SUCCESS)
+    {
+        fprintf(stderr, "%s:Couldn't set jpeg output port format : error %d", status);
+        goto error;
+    }
+
+    status = mmal_port_parameter_set_uint32(output_port,
+            MMAL_PARAMETER_JPEG_Q_FACTOR, 100);
+    if (status != MMAL_SUCCESS)
+    {
+        fprintf(stderr, "%s:Couldn't set jpeg quality : error %d", status);
+        goto error;
+    }
+
+    userdata->jpeg_encoder_output_pool
+        = (MMAL_POOL_T *) mmal_port_pool_create(output_port,
+                output_port->buffer_num, output_port->buffer_size);
+    output_port->userdata = (struct MMAL_PORT_USERDATA_T *) userdata;
+
+    connect_ports(source_port,
+            jpeg_component->input[0], &userdata->jpeg_connection);
+
+    if (mmal_port_enable(output_port, jpeg_encoder_output_buffer_callback)!=MMAL_SUCCESS)
+    {
+        fprintf(stderr,"can't enable jpeg encoder output port");
+        goto error;
+    }
+
+    fill_port_buffer(output_port, userdata->jpeg_encoder_output_pool);
+
+    return 0;
+
+error:
+    if (jpeg_component) {
+        mmal_component_destroy(jpeg_component);
+    }
+    return -1;
+
 }
 
 void send_html_response(int fd, const char* body)
@@ -545,9 +662,7 @@ int server_on_url(http_parser *parser, const char *data, size_t length)
             userdata.snapshot_request_n = 1;
 
             while(userdata.snapshot_request_n)
-            {
                 pthread_cond_wait(&userdata.img_cond, &userdata.img_lock);
-            }
 
             char* http_header = calloc(1024, sizeof(char));
 
@@ -787,15 +902,56 @@ int main(int argc, char** argv) {
 
     bcm_host_init();
 
-    if (1 && setup_camera(&userdata) != 0) {
+
+    //setup camera
+    printf("creat camera\n");
+    if (setup_camera(&userdata)) {
         fprintf(stderr, "Error: setup camera %x\n", status);
         return -1;
     }
+    printf("creat splitter\n");
+    //setup splitter and connect camera output to splitter
+    if (setup_splitter(&userdata))
+    {
+        fprintf(stderr, "Error: setup splitter %x\n", status);
+        return -1;
+    }
+    printf("creat resizer\n");
+    //setup resize component and connect splitter output to resize component
+    if (setup_resizer(&userdata, SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT))
+    {
+        fprintf(stderr, "Error: can't setup resize component\n");
+        return -1;
+    }
 
-    if (1 && setup_encoder(&userdata) != 0) {
+    //setup h264 video encoder and connect splitter output to h264 encoder commponent
+    printf("creat video encoder\n");
+    if (setup_video_encoder(&userdata)) {
         fprintf(stderr, "Error: setup encoder %x\n", status);
         return -1;
     }
+
+    //initialize h264 video output
+    //mmal_output_init("mmalcam", &userdata->camera_output,
+    //        userdata->resize_component->output[0], 0);
+
+    //setup jpeg encoder and connect resizer component to jpeg component
+    printf("creat jpeg encoder\n");
+    if (setup_jpeg_encoder(&userdata)) {
+        fprintf(stderr, "Error: setup encoder %x\n", status);
+        return -1;
+    }
+
+    if (mmal_port_parameter_set_boolean(
+                userdata.camera->output[MMAL_CAMERA_VIDEO_PORT],
+                MMAL_PARAMETER_CAPTURE, 1)!= MMAL_SUCCESS)
+    {
+        printf("%s: Failed to start capture\n", __func__);
+        return -1;
+    }
+
+
+    //initialize jpeg snapshot output
 
     //create a server and handle request, never return
     create_server();
